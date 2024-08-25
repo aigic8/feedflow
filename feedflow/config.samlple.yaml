@@ -1,0 +1,3 @@
+dbURI: user=postgres password=postgres localhost port=1234 dbname=postgres
+botToken: BOT_TOKEN
+channelID: "0000000000000000000"
