@@ -6,12 +6,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-RUN go build ./cmd/feedflow -o main
+RUN CGO_ENABLED=0 go build -o ./main ./cmd/feedflow
 
 FROM alpine:latest
 
 WORKDIR /app
-COPY --from=builder /app/main .
+COPY --from=builder /app/main ./main
 
 CMD ["./main"]
-
