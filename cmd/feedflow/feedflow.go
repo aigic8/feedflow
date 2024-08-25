@@ -68,6 +68,9 @@ func main() {
 		log.Fatalf("creating cron session: %v", err)
 	}
 	app := App{db: db, notify: appNotify}
+	// TODO: refactor
+	feedURLs := app.readFeeds()
+	app.updateFeeds(feedURLs)
 	jobDef := gocron.CronJob("0 */6 * * *", false)
 	task := gocron.NewTask(app.checkForArticles)
 	if _, err = cronSession.NewJob(jobDef, task); err != nil {
@@ -85,79 +88,43 @@ type App struct {
 }
 
 func (app App) checkForArticles() {
-	wd, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("getting working directory: %v", err)
-	}
-	feedURLsFilePath := path.Join(wd, FEEDS_FILE_PATH)
-	feedsFile, err := os.Open(feedURLsFilePath)
-	if err != nil {
-		log.Fatalf("opening feeds file: %v", err)
-	}
-	feedsFileBytes, err := io.ReadAll(feedsFile)
-	if err != nil {
-		log.Fatalf("reading feeds file: %v", err)
-	}
-
-	lines := strings.Split(string(feedsFileBytes), "\n")
-	feedURLs := []string{}
-	for _, line := range lines {
-		feedURL := strings.TrimSpace(line)
-		if feedURL == "" {
-			continue
-		}
-		feedURLs = append(feedURLs, feedURL)
-	}
+	feedURLs := app.readFeeds()
+	app.updateFeeds(feedURLs)
 
 	for _, feedURL := range feedURLs {
-		// TODO: use batch insert instead
-		res := app.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Feed{URL: feedURL, LastChecked: time.Now()})
-		if res.Error != nil {
-			log.Printf("ERROR: inserting feed '%s': %v\n", feedURL, err)
+		fp := gofeed.NewParser()
+		feed, err := fp.ParseURL(feedURL)
+		if err != nil {
+			log.Printf("ERROR: reading feed '%s': %v\n", feedURL, err)
+			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
-		defer cancel()
-		if err = app.notify.Send(ctx, "", fmt.Sprintf("feed '%s' was added", feedURL)); err != nil {
-			log.Printf("ERROR: notifying %v\n", err)
-		}
-	}
 
-	for {
-		for _, feedURL := range feedURLs {
-			fp := gofeed.NewParser()
-			feed, err := fp.ParseURL(feedURL)
-			if err != nil {
-				log.Printf("ERROR: reading feed '%s': %v\n", feedURL, err)
+		var dbFeed Feed
+		if res := app.db.Where(&Feed{URL: feedURL}).First(&dbFeed); res.Error != nil {
+			log.Printf("ERROR: getting feed '%s' from db: %v\n", feedURL, err)
+			continue
+		}
+
+		for _, item := range feed.Items {
+			if item.PublishedParsed == nil {
+				log.Printf("no published date in feed '%s'\n", feedURL)
 				continue
 			}
-
-			var dbFeed Feed
-			if res := app.db.Where(&Feed{URL: feedURL}).First(&dbFeed); res.Error != nil {
-				log.Printf("ERROR: getting feed '%s' from db: %v\n", feedURL, err)
-				continue
-			}
-
-			for _, item := range feed.Items {
-				if item.PublishedParsed == nil {
-					log.Printf("no published date in feed '%s'\n", feedURL)
+			if item.PublishedParsed.After(dbFeed.LastChecked) {
+				messageContent := fmt.Sprintf("%s\n%s", item.Title, item.Link)
+				ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
+				defer cancel()
+				if err := app.notify.Send(ctx, "", messageContent); err != nil {
+					log.Printf("sending notification: %v\n", err)
 					continue
 				}
-				if item.PublishedParsed.After(dbFeed.LastChecked) {
-					messageContent := fmt.Sprintf("%s\n%s", item.Title, item.Link)
-					ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
-					defer cancel()
-					if err := app.notify.Send(ctx, "", messageContent); err != nil {
-						log.Printf("sending notification: %v\n", err)
-						continue
-					}
-				}
 			}
+		}
 
-			dbFeed.LastChecked = time.Now()
-			if res := app.db.Save(&dbFeed); res.Error != nil {
-				log.Printf("error updating feed '%s' in db: %v\n", feedURL, err)
-				continue
-			}
+		dbFeed.LastChecked = time.Now()
+		if res := app.db.Save(&dbFeed); res.Error != nil {
+			log.Printf("error updating feed '%s' in db: %v\n", feedURL, err)
+			continue
 		}
 	}
 }
@@ -184,4 +151,49 @@ func readConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+// TODO: refactor should return error too
+func (app *App) updateFeeds(feedURLs []string) {
+	for _, feedURL := range feedURLs {
+		// TODO: use batch insert instead
+		res := app.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Feed{URL: feedURL, LastChecked: time.Now()})
+		if res.Error != nil {
+			log.Printf("ERROR: inserting feed '%s': %v\n", feedURL, res.Error)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
+		defer cancel()
+		if err := app.notify.Send(ctx, "", fmt.Sprintf("feed '%s' was added", feedURL)); err != nil {
+			log.Printf("ERROR: notifying %v\n", err)
+		}
+	}
+}
+
+// TODO: refactor should return error too
+func (app *App) readFeeds() []string {
+	wd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("getting working directory: %v", err)
+	}
+	feedURLsFilePath := path.Join(wd, FEEDS_FILE_PATH)
+	feedsFile, err := os.Open(feedURLsFilePath)
+	if err != nil {
+		log.Fatalf("opening feeds file: %v", err)
+	}
+	feedsFileBytes, err := io.ReadAll(feedsFile)
+	if err != nil {
+		log.Fatalf("reading feeds file: %v", err)
+	}
+
+	lines := strings.Split(string(feedsFileBytes), "\n")
+	feedURLs := []string{}
+	for _, line := range lines {
+		feedURL := strings.TrimSpace(line)
+		if feedURL == "" {
+			continue
+		}
+		feedURLs = append(feedURLs, feedURL)
+	}
+
+	return feedURLs
 }
