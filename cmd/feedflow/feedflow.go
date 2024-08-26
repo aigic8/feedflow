@@ -158,13 +158,17 @@ func (app *App) updateFeeds(feedURLs []string) {
 	for _, feedURL := range feedURLs {
 		// TODO: use batch insert instead
 		res := app.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Feed{URL: feedURL, LastChecked: time.Now()})
+		// TODO: check if error is already exists, then return do not log the error
+		// good source: https://github.com/go-gorm/gorm/issues/4037
 		if res.Error != nil {
 			log.Printf("ERROR: inserting feed '%s': %v\n", feedURL, res.Error)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
-		defer cancel()
-		if err := app.notify.Send(ctx, "", fmt.Sprintf("feed '%s' was added", feedURL)); err != nil {
-			log.Printf("ERROR: notifying %v\n", err)
+		if res.RowsAffected > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
+			defer cancel()
+			if err := app.notify.Send(ctx, "", fmt.Sprintf("feed '%s' was added", feedURL)); err != nil {
+				log.Printf("ERROR: notifying %v\n", err)
+			}
 		}
 	}
 }
