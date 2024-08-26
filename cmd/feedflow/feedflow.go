@@ -11,15 +11,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aigic8/feedflow/internal/db"
 	"github.com/go-co-op/gocron/v2"
 	"github.com/go-playground/validator/v10"
+	"github.com/guregu/null/v5"
 	"github.com/mmcdole/gofeed"
 	"github.com/nikoksr/notify"
 	"github.com/nikoksr/notify/service/discord"
 	"gopkg.in/yaml.v3"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 const DISCORD_TIMEOUT = 10 * time.Second
@@ -30,8 +31,10 @@ const CONFIG_PATH = "feedflow/config.yaml"
 type (
 	Feed struct {
 		gorm.Model
-		URL         string `gorm:"unique"`
-		LastChecked time.Time
+		URL           string `gorm:"unique"`
+		LastChecked   time.Time
+		DeactivatedOn null.Time
+		LastSeen      time.Time `gorm:"not null"`
 	}
 
 	Config struct {
@@ -54,20 +57,22 @@ func main() {
 	discordService := discord.New()
 	discordService.AuthenticateWithBotToken(config.BotToken)
 	discordService.AddReceivers(config.ChannelID)
-	db, err := gorm.Open(postgres.Open(config.DbURI), &gorm.Config{})
+	appDB, err := db.NewDB(postgres.Open(config.DbURI))
 	if err != nil {
-		log.Fatalf("connecting to db: %v", err)
+		log.Fatalf("creating db: %v", err)
 	}
+	if err = appDB.AutoMigrate(); err != nil {
+		log.Fatalf("auto-migrating db: %v", err)
+	}
+
 	appNotify := notify.New()
 	appNotify.UseServices(discordService)
-
-	db.AutoMigrate(&Feed{})
 
 	cronSession, err := gocron.NewScheduler()
 	if err != nil {
 		log.Fatalf("creating cron session: %v", err)
 	}
-	app := App{db: db, notify: appNotify}
+	app := App{db: appDB, notify: appNotify}
 	// TODO: refactor
 	feedURLs := app.readFeeds()
 	app.updateFeeds(feedURLs)
@@ -83,7 +88,7 @@ func main() {
 }
 
 type App struct {
-	db     *gorm.DB
+	db     *db.DB
 	notify *notify.Notify
 }
 
@@ -99,8 +104,8 @@ func (app App) checkForArticles() {
 			continue
 		}
 
-		var dbFeed Feed
-		if res := app.db.Where(&Feed{URL: feedURL}).First(&dbFeed); res.Error != nil {
+		dbFeed, err := app.db.FeedGet(feedURL)
+		if err != nil {
 			log.Printf("ERROR: getting feed '%s' from db: %v\n", feedURL, err)
 			continue
 		}
@@ -121,9 +126,8 @@ func (app App) checkForArticles() {
 			}
 		}
 
-		dbFeed.LastChecked = time.Now()
-		if res := app.db.Save(&dbFeed); res.Error != nil {
-			log.Printf("error updating feed '%s' in db: %v\n", feedURL, err)
+		if err = app.db.FeedSetLastChecked(dbFeed.URL, time.Now()); err != nil {
+			log.Printf("error setting last checked for feed '%s': %v\n", feedURL, err)
 			continue
 		}
 	}
@@ -155,20 +159,33 @@ func readConfig(configPath string) (*Config, error) {
 
 // TODO: refactor should return error too
 func (app *App) updateFeeds(feedURLs []string) {
-	for _, feedURL := range feedURLs {
-		// TODO: use batch insert instead
-		res := app.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&Feed{URL: feedURL, LastChecked: time.Now()})
-		// TODO: check if error is already exists, then return do not log the error
-		// good source: https://github.com/go-gorm/gorm/issues/4037
-		if res.Error != nil {
-			log.Printf("ERROR: inserting feed '%s': %v\n", feedURL, res.Error)
+	feedUpdateResult, err := app.db.FeedUpdateMany(feedURLs)
+	if err != nil {
+		log.Printf("ERROR: updating feeds: %v\n", err)
+		return
+	}
+
+	addedFeedsLen := len(feedUpdateResult.AddedFeeds)
+	if addedFeedsLen > 0 {
+		addedFeedURLs := getFeedURLs(feedUpdateResult.AddedFeeds)
+		addedFeedURLsStr := strings.Join(addedFeedURLs, "\n")
+
+		ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
+		defer cancel()
+		if err := app.notify.Send(ctx, "", fmt.Sprintf("%d feed(s) were added:\n%s", addedFeedsLen, addedFeedURLsStr)); err != nil {
+			log.Printf("ERROR: notifying %v\n", err)
 		}
-		if res.RowsAffected > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
-			defer cancel()
-			if err := app.notify.Send(ctx, "", fmt.Sprintf("feed '%s' was added", feedURL)); err != nil {
-				log.Printf("ERROR: notifying %v\n", err)
-			}
+	}
+
+	deactivatedFeedsLen := len(feedUpdateResult.DeactivatedFeeds)
+	if deactivatedFeedsLen > 0 {
+		deactivatedFeedURLs := getFeedURLs(feedUpdateResult.DeactivatedFeeds)
+		deactivatedFeedURLsStr := strings.Join(deactivatedFeedURLs, "\n")
+
+		ctx, cancel := context.WithTimeout(context.Background(), DISCORD_TIMEOUT)
+		defer cancel()
+		if err := app.notify.Send(ctx, "", fmt.Sprintf("%d feed(s) were deactivated:\n%s", deactivatedFeedsLen, deactivatedFeedURLsStr)); err != nil {
+			log.Printf("ERROR: notifying %v\n", err)
 		}
 	}
 }
@@ -199,5 +216,13 @@ func (app *App) readFeeds() []string {
 		feedURLs = append(feedURLs, feedURL)
 	}
 
+	return feedURLs
+}
+
+func getFeedURLs(feeds []db.Feed) []string {
+	feedURLs := []string{}
+	for _, feed := range feeds {
+		feedURLs = append(feedURLs, feed.URL)
+	}
 	return feedURLs
 }
